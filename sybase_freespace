@@ -1,0 +1,180 @@
+#!/bin/bash
+
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+# This file is subject to the terms and conditions of the GNU General Public
+# License v.3.  See the file "LICENSE" in the main directory of this archive
+# for more details.
+#
+#
+# Author: Adam Leszczynski, aleszczynski@bersler.com
+# Version: 1.0, 30.11.2017
+# Home page: https://www.bersler.com/blog/nagios-script-for-checking-sap-adaptive-server-enterprise-sybase-ase/
+# 
+# Script for monitoring SAP (Sybase) Adaptive Server Enterprise (ASE) using Nagios
+#
+# 
+# Script performs the following checks:
+# - the server is up
+# - no blocked processes (default threshold is 300 seconds)
+# - no long running transactions (default threshold is 300 seconds)
+# - log segment is not full in all databasess
+# - free space in data segment for all databasess
+#
+#
+# The script requires a local installation of Open Client ($SYBASE path and isql binary).
+#
+# parameters:
+# maximum allowed time for blocked processes
+BLOCKEDTIME=300
+# maximum time for long running transactions
+LONGRUNTIME=300
+# warning level for free space
+FREESPACEPCTWARN=90
+# critical level for free space
+FREESPACEPCTERR=95
+
+# default values
+SERVER=
+LOGIN=
+PASSWORD=
+CHARACTERSET=iso_1
+SYBASE=/opt/sybase
+
+# variables
+NUMDATABASES=0
+NUMPROCESSES=0
+EXTRAINFO=""
+
+while getopts "S:U:P:c:?" opt; do
+  case $opt in
+    S)
+	  SERVER=$OPTARG
+      ;;
+    U)
+	  LOGIN=$OPTARG
+      ;;
+    P)
+	  PASSWORD=$OPTARG
+      ;;
+    C)
+	  CHARACTERSET=$OPTARG
+      ;;
+    X)
+	  SYBASE=$OPTARG
+      ;;
+    \?)
+	  echo "ERROR, use: check_sybase_ase.sh -S server -U login [-P password] [-C character set] [-X path_to_sybase_installation]"
+	  exit
+      ;;
+  esac
+done
+
+if [ -z $SERVER ]; then
+	echo "ERROR: -S missing"
+	exit
+fi
+if [ -z $LOGIN ]; then
+	echo "ERROR: -U missing"
+	exit
+fi
+
+if [ ! -x $SYBASE/SYBASE.sh ]; then
+	echo "ERROR: Missing file: $SYBASE/SYBASE.sh"
+	exit
+fi
+
+source $SYBASE/SYBASE.sh
+unset LANG
+
+
+########################################################################
+#free space
+out1=`isql -U$LOGIN -P$PASSWORD -S$SERVER -w500 -J$CHARACTERSET << EOF
+set nocount on
+set transaction isolation level 0
+go
+
+select
+    convert(char(20), db_name(dbid)) dbname,
+    segmap,
+    sum(size) / (1048576 / @@maxpagesize) allocatedMB,
+    case when segmap = 4 then
+        lct_admin("logsegment_freepages", dbid)
+    else
+        sum(curunreservedpgs(dbid, lstart, unreservedpgs))
+    end / (1048576 / @@maxpagesize) as freeMB,
+    case when lct_admin("logfull", dbid) = 1 and segmap & 4 = 4
+        then 100
+    else 
+        ceiling(round(convert(numeric(15, 4), 
+		(sum(convert(numeric(15, 4), size)) -
+        case when segmap = 4 then
+            lct_admin("logsegment_freepages", dbid)
+        else
+            sum(convert(numeric(15, 4), curunreservedpgs(dbid, lstart, unreservedpgs)))
+        end
+        ) / sum(convert(numeric(15, 4), size))), 4) * 100)
+    end as freePercent
+from 
+    master..sysusages
+where 
+    dbid in 
+        (select dbid from master..sysdatabases where (status3 & 8192 != 8192 or status3 is null) and status & 32 != 32 and status2 & (16 + 32) = 0) 
+group by 
+    dbid,
+    segmap
+go
+EOF`
+
+out2=`echo "$out1" | grep -v "-"`
+out=`echo "$out2" | grep -v "dbname"`
+
+fulldb=""
+numfulldb=0
+IFS=$'\n'
+warning=""
+error=""
+NEWLINE=$'\n'
+for a in $out; do
+        dbname=`echo "$a" | awk '{ print $1 }'`
+        segmap=`echo "$a" | awk '{ print $2 }'`
+        allocatedmb=`echo "$a" | awk '{ print $3 }'`
+        freemb=`echo "$a" | awk '{ print $4 }'`
+        freepercent=`echo "$a" | awk '{ print $5 }'`
+
+        if [[ $freepercent > $FREESPACEPCTWARN ]]; then
+                if [[ "$fulldb" == "" ]]; then
+                        fulldb="$dbname ($freepercent% for segmap $segmap)"
+                else
+                        fulldb="$fulldb, $dbname ($freepercent% for segmap $segmap)"
+                fi;
+                numfulldb=$((numfulldb+1))
+                warning=1;
+        EXTRAINFO="$EXTRAINFO ${dbname}_seg${segmap}=${freepercent}${NEWLINE}"
+        fi;
+        if [[ $freepercent -ge $FREESPACEPCTERR ]]; then
+                error=1;
+        EXTRAINFO="$EXTRAINFO ${dbname}_seg${segmap}=${freepercent}${NEWLINE}"
+        fi;
+done;
+
+if [ ! -z "$fulldb" ]; then
+        if [ "$error" != "0" ]; then
+                echo "ASE SERVER CRITICAL - $numfulldb space: $fulldb ${EXTRAINFO}"
+                exit $CRITICAL
+        elif [ "$warning" != "0" ]; then
+                echo "ASE SERVER WARNING - $numfulldb space: $fulldb  ${EXTRAINFO}"
+                exit $WARNING
+        else
+                echo "No database free space require attention"
+                exit OK
+        fi
+else
+        echo "No database free space require attention"
+        exit OK
+fi
+
